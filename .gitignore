@@ -1,3 +1,8 @@
+# Environment files with API keys
+.env
+.env.local
+.env.*.local
+
 # Claude settings (should be per-project)
 .claude/
 .claude.json
