@@ -6,7 +6,8 @@ A portable Docker-based development environment for [Claude Code](https://claude
 
 - 🚀 **Multi-provider support** - GLM, MiniMax, and Kimi providers
 - 🔧 **Unified script** - Single `cc.sh` script for all providers
-- 📁 **Per-project settings** - Each project has isolated `.claude/` configuration
+- 🐳 **Shared Docker image** - All providers use the same `claude-dev-container` image
+- 📁 **Flexible settings** - Project-level or user-level Claude settings (auto-detect)
 - 🐳 **Smart container naming** - Containers named by provider and folder (e.g., `minimax-project`, `kimi-project`)
 - 🔄 **Multiple sessions** - Run multiple containers of the same provider on the same folder
 - 🌐 **Chrome/Playwright** - Browser automation support built-in
@@ -38,21 +39,21 @@ Edit `/Volumes/Dev/claude-env/.env` and update the API keys:
 # GLM Provider
 GLM_API_KEY=your_glm_api_key_here
 GLM_API_BASE_URL=https://open.bigmodel.cn/api/anthropic
-GLM_IMAGE_NAME=claude-dev-container
-GLM_API_TIMEOUT_MS=300000
+GLM_API_TIMEOUT_MS=3000000
 
 # MiniMax Provider
 MINIMAX_API_KEY=your_minimax_api_key_here
 MINIMAX_API_BASE_URL=https://api.minimaxi.com/anthropic
-MINIMAX_IMAGE_NAME=claude-kimi-container
 MINIMAX_API_TIMEOUT_MS=3000000
-MINIMAX_MODEL=MiniMax-M2.1
+MINIMAX_MODEL=MiniMax-M2.5
 
 # Kimi Provider
 KIMI_API_KEY=your_kimi_api_key_here
 KIMI_API_BASE_URL=https://api.kimi.com/coding/
-KIMI_IMAGE_NAME=claude-kimi-container
-KIMI_API_TIMEOUT_MS=300000
+KIMI_API_TIMEOUT_MS=3000000
+
+# Note: All providers share the same Docker image: claude-dev-container
+# Only API keys, endpoints, timeouts, and model configurations differ per provider
 ```
 
 ### 3. Create a symlink (optional)
@@ -182,14 +183,16 @@ Work with multiple projects from a single container.
 
 ```
 your-project/
-├── .claude/              ← Project-specific Claude settings
+├── .claude/              ← Project-specific Claude settings (optional)
 │   ├── commands/         ← Custom commands
 │   ├── skills/           ← Custom skills
 │   ├── plugins/          ← MCP servers
 │   └── settings.json     ← Claude configuration
-├── .claude.json          ← Project config
+├── .claude.json          ← Project config (optional)
 └── .npm-global/          ← Persistent npm packages (auto-created)
 ```
+
+**Note:** Project-level `.claude/` and `.claude.json` are optional. If not present, the container will use your user-level settings from `~/.claude/` and `~/.claude.json`.
 
 ## Container Naming
 
@@ -238,9 +241,11 @@ If you try to run the same provider/folder/session combination, the script offer
 | Host Path | Container Path | Purpose |
 |-----------|---------------|---------|
 | `$PROJECT_DIR` | `/workspace` | Project files |
-| `$PROJECT_DIR/.claude` | `/home/node/.claude` | Claude settings |
-| `$PROJECT_DIR/.claude.json` | `/home/node/.claude.json` | Claude config |
+| `~/.claude` or `$PROJECT_DIR/.claude` | `/home/node/.claude` | Claude settings (user or project) |
+| `~/.claude.json` or `$PROJECT_DIR/.claude.json` | `/home/node/.claude.json` | Claude config (user or project) |
 | `$PROJECT_DIR/.npm-global` | `/usr/local/share/npm-global` | Global npm packages |
+
+**Settings Priority:** Project-level settings override user-level settings when both exist. If project-level settings don't exist, user-level settings are used automatically.
 
 ## Configuration
 
@@ -252,12 +257,13 @@ The script reads configuration from `/Volumes/Dev/claude-env/.env` (same directo
 
 - `{PROVIDER}_API_KEY` - API key for the provider
 - `{PROVIDER}_API_BASE_URL` - API endpoint URL
-- `{PROVIDER}_IMAGE_NAME` - Docker image name (optional, defaults to `claude-dev-container`)
 - `{PROVIDER}_API_TIMEOUT_MS` - API timeout in milliseconds (optional)
 
 **MiniMax-specific:**
 
-- `MINIMAX_MODEL` - Model name (e.g., `MiniMax-M2.1`)
+- `MINIMAX_MODEL` - Model name (e.g., `MiniMax-M2.5`)
+
+**Note:** All providers share the same Docker image `claude-dev-container`. Only runtime environment variables differ.
 
 ### Environment Variables in Container
 
@@ -269,6 +275,13 @@ The script sets these environment variables in the container:
 - `CLAUDE_CODE_CONTAINER_MODE=1` - Enable container mode
 - `BYPASS_ALL_CONFIRMATIONS=1` - Auto-confirm prompts
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` - Disable telemetry
+- `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` - Enable agent teams feature
+
+**GLM-specific variables:**
+
+- `ANTHROPIC_DEFAULT_HAIKU_MODEL` - Haiku model (default: `glm-5`)
+- `ANTHROPIC_DEFAULT_SONNET_MODEL` - Sonnet model (default: `glm-5`)
+- `ANTHROPIC_DEFAULT_OPUS_MODEL` - Opus model (default: `glm-5`)
 
 **MiniMax-specific variables:**
 
@@ -290,12 +303,38 @@ cp -r ~/.claude/plugins .claude/
 cp ~/.claude/settings.json .claude/
 ```
 
+### User-Level vs Project-Level Settings
+
+The script automatically detects which settings to use:
+
+- **Project-level settings** (`.claude/` and `.claude.json` in project root) take priority
+- **User-level settings** (`~/.claude/` and `~/.claude.json`) are used as fallback
+
+When you run the script, it shows which settings are being used:
+
+```
+👤 Using user-level Claude settings from /Users/username
+```
+
+Or if project settings exist:
+
+```
+📁 Using project-level Claude settings
+   .claude directory: project
+   .claude.json: project
+```
+
+This means you can:
+- Use your global Claude settings across all projects without copying
+- Override with project-specific settings when needed
+- Mix user-level and project-level settings (e.g., user commands, project config)
+
 ## Docker Image Details
 
 The Dockerfile includes:
 
 - **Base**: `node:20`
-- **Dev tools**: git, zsh, fzf, vim, nano, jq, gh (GitHub CLI)
+- **Dev tools**: git, zsh, fzf, vim, nano, jq, tmux, gh (GitHub CLI)
 - **Playwright + Chromium**: For webapp-testing skill
 - **Claude Code**: Latest version from npm
 - **User**: Runs as non-root `node` user

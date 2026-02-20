@@ -21,7 +21,7 @@ ENV_FILE="$SCRIPT_DIR/.env"
 # Default configuration
 DOCKERFILE_DIR="/Volumes/Dev/claude-env/docker"
 DEFAULT_PROVIDER="glm"
-DEFAULT_API_TIMEOUT_MS="300000"
+DEFAULT_API_TIMEOUT_MS="3000000"
 
 # Parse arguments
 PROVIDER="$DEFAULT_PROVIDER"
@@ -127,21 +127,21 @@ else
 # GLM Provider
 GLM_API_KEY=your_glm_api_key_here
 GLM_API_BASE_URL=https://open.bigmodel.cn/api/anthropic
-GLM_IMAGE_NAME=claude-dev-container
-GLM_API_TIMEOUT_MS=300000
+GLM_API_TIMEOUT_MS=3000000
 
 # MiniMax Provider
 MINIMAX_API_KEY=your_minimax_api_key_here
 MINIMAX_API_BASE_URL=https://api.minimaxi.com/anthropic
-MINIMAX_IMAGE_NAME=claude-kimi-container
 MINIMAX_API_TIMEOUT_MS=3000000
-MINIMAX_MODEL=MiniMax-M2.1
+MINIMAX_MODEL=MiniMax-M2.5
 
 # Kimi Provider
 KIMI_API_KEY=your_kimi_api_key_here
 KIMI_API_BASE_URL=https://api.kimi.com/coding/
-KIMI_IMAGE_NAME=claude-kimi-container
 KIMI_API_TIMEOUT_MS=300000
+
+# Note: All providers share the same Docker image: claude-dev-container
+# Only API keys, endpoints, timeouts, and model configurations differ per provider
 EOF
     echo "✅ Created template .env file at $ENV_FILE"
     echo "   Please update it with your API keys and endpoints, then run the script again."
@@ -152,13 +152,14 @@ fi
 PROVIDER_UPPER=$(echo "$PROVIDER" | tr '[:lower:]' '[:upper:]')
 API_KEY_VAR="${PROVIDER_UPPER}_API_KEY"
 API_BASE_URL_VAR="${PROVIDER_UPPER}_API_BASE_URL"
-IMAGE_NAME_VAR="${PROVIDER_UPPER}_IMAGE_NAME"
 API_TIMEOUT_VAR="${PROVIDER_UPPER}_API_TIMEOUT_MS"
 
 # Get values from environment (with defaults)
+# All providers share the same Docker image (only runtime env vars differ)
+# Force same image name for all providers to ensure consistency
+IMAGE_NAME="claude-dev-container"
 API_KEY="${!API_KEY_VAR}"
 API_BASE_URL="${!API_BASE_URL_VAR}"
-IMAGE_NAME="${!IMAGE_NAME_VAR:-claude-dev-container}"
 API_TIMEOUT_MS="${!API_TIMEOUT_VAR:-$DEFAULT_API_TIMEOUT_MS}"
 
 # Validate required variables
@@ -172,9 +173,16 @@ if [ -z "$API_BASE_URL" ]; then
     exit 1
 fi
 
+# Load GLM-specific model variables if provider is glm
+if [ "$PROVIDER" = "glm" ]; then
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-5}"
+    ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5}"
+    ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5}"
+fi
+
 # Load MiniMax-specific model variables if provider is minimax
 if [ "$PROVIDER" = "minimax" ]; then
-    MINIMAX_MODEL="${MINIMAX_MODEL:-MiniMax-M2.1}"
+    MINIMAX_MODEL="${MINIMAX_MODEL:-MiniMax-M2.5}"
     ANTHROPIC_MODEL="$MINIMAX_MODEL"
     ANTHROPIC_SMALL_FAST_MODEL="$MINIMAX_MODEL"
     ANTHROPIC_DEFAULT_SONNET_MODEL="$MINIMAX_MODEL"
@@ -182,9 +190,49 @@ if [ "$PROVIDER" = "minimax" ]; then
     ANTHROPIC_DEFAULT_HAIKU_MODEL="$MINIMAX_MODEL"
 fi
 
-# Ensure .claude.json exists as a file with valid JSON
-if [ ! -s "$PROJECT_DIR/.claude.json" ]; then
-    echo "{}" > "$PROJECT_DIR/.claude.json"
+# Determine Claude settings paths (user-level vs project-level)
+# Default to host user's Claude settings, project settings override when present
+HOST_HOME="${HOME:-/root}"
+HOST_CLAUDE_DIR="$HOST_HOME/.claude"
+HOST_CLAUDE_JSON="$HOST_HOME/.claude.json"
+
+# Check if project has its own Claude settings (these will override user settings)
+PROJECT_CLAUDE_DIR="$PROJECT_DIR/.claude"
+PROJECT_CLAUDE_JSON="$PROJECT_DIR/.claude.json"
+
+# Determine which settings to use (project overrides user, but can mix)
+# For .claude directory: use project if exists, otherwise user
+if [ -d "$PROJECT_CLAUDE_DIR" ]; then
+    CLAUDE_DIR="$PROJECT_CLAUDE_DIR"
+    CLAUDE_DIR_SOURCE="project"
+else
+    CLAUDE_DIR="$HOST_CLAUDE_DIR"
+    CLAUDE_DIR_SOURCE="user"
+fi
+
+# For .claude.json: use project if exists, otherwise user
+if [ -f "$PROJECT_CLAUDE_JSON" ]; then
+    CLAUDE_JSON="$PROJECT_CLAUDE_JSON"
+    CLAUDE_JSON_SOURCE="project"
+else
+    CLAUDE_JSON="$HOST_CLAUDE_JSON"
+    CLAUDE_JSON_SOURCE="user"
+fi
+
+# Show which settings are being used
+if [ "$CLAUDE_DIR_SOURCE" = "project" ] || [ "$CLAUDE_JSON_SOURCE" = "project" ]; then
+    echo "📁 Using project-level Claude settings"
+    [ "$CLAUDE_DIR_SOURCE" = "project" ] && echo "   .claude directory: project"
+    [ "$CLAUDE_JSON_SOURCE" = "project" ] && echo "   .claude.json: project"
+    [ "$CLAUDE_DIR_SOURCE" = "user" ] && echo "   .claude directory: user ($HOST_HOME)"
+    [ "$CLAUDE_JSON_SOURCE" = "user" ] && echo "   .claude.json: user ($HOST_HOME)"
+else
+    echo "👤 Using user-level Claude settings from $HOST_HOME"
+fi
+
+# Ensure .claude.json exists as a file with valid JSON (only for project, not user)
+if [ "$CLAUDE_JSON" = "$PROJECT_CLAUDE_JSON" ] && [ ! -s "$PROJECT_CLAUDE_JSON" ]; then
+    echo "{}" > "$PROJECT_CLAUDE_JSON"
 fi
 
 # Show mode
@@ -233,7 +281,8 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     fi
 fi
 
-echo "📦 Container name: $CONTAINER_NAME"
+echo "📦 Image: $IMAGE_NAME (shared across all providers)"
+echo "🐳 Container: $CONTAINER_NAME"
 echo "🔑 Provider: $PROVIDER"
 if [ -n "$SESSION_ID" ]; then
     echo "🔖 Session: $SESSION_ID"
@@ -265,8 +314,18 @@ DOCKER_ENV_ARGS=(
     -e "API_TIMEOUT_MS=$API_TIMEOUT_MS"
     -e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
     -e "CLAUDE_CODE_CONTAINER_MODE=1"
+    -e "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
     -e "BYPASS_ALL_CONFIRMATIONS=1"
 )
+
+# Add GLM-specific model environment variables if provider is glm
+if [ "$PROVIDER" = "glm" ]; then
+    DOCKER_ENV_ARGS+=(
+        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL"
+        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL"
+        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL"
+    )
+fi
 
 # Add MiniMax-specific model environment variables if provider is minimax
 if [ "$PROVIDER" = "minimax" ]; then
@@ -279,13 +338,26 @@ if [ "$PROVIDER" = "minimax" ]; then
     )
 fi
 
+# Prepare volume mounts for Claude settings
+# Mount the determined Claude directory and JSON file
+DOCKER_VOLUME_ARGS=(
+    -v "$PROJECT_DIR:/workspace"
+)
+
+# Mount Claude settings (project-level if exists, otherwise user-level)
+if [ -d "$CLAUDE_DIR" ]; then
+    DOCKER_VOLUME_ARGS+=(-v "$CLAUDE_DIR:/home/node/.claude")
+fi
+
+if [ -f "$CLAUDE_JSON" ]; then
+    DOCKER_VOLUME_ARGS+=(-v "$CLAUDE_JSON:/home/node/.claude.json")
+fi
+
 # Run Claude Code in Docker
 docker run -it --rm \
     --name "$CONTAINER_NAME" \
     "${DOCKER_ENV_ARGS[@]}" \
-    -v "$PROJECT_DIR:/workspace" \
-    -v "$PROJECT_DIR/.claude:/home/node/.claude" \
-    -v "$PROJECT_DIR/.claude.json:/home/node/.claude.json" \
+    "${DOCKER_VOLUME_ARGS[@]}" \
     -w /workspace \
     --network host \
     "$IMAGE_NAME" \
