@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 
 # Default configuration
-DOCKERFILE_DIR="/Volumes/Dev/claude-env/docker"
+DOCKERFILE_DIR="/Users/kato/dev/claude-env/docker"
 DEFAULT_PROVIDER="glm"
 DEFAULT_API_TIMEOUT_MS="3000000"
 
@@ -67,7 +67,7 @@ while [ $i -le $# ]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --provider, -p PROVIDER  Provider to use: glm, minimax, or kimi (default: glm)"
+            echo "  --provider, -p PROVIDER  Provider to use: glm, minimax, kimi, or qwen (default: glm)"
             echo "                           Can be omitted - defaults to glm"
             echo "  --workspace             Workspace mode (use current directory)"
             echo "  --path PATH             Specific project directory"
@@ -81,6 +81,7 @@ while [ $i -le $# ]; do
             echo "  $0 --rebuild                         # Rebuild GLM image"
             echo "  $0 -p minimax                        # Run with MiniMax (short form)"
             echo "  $0 --provider kimi --rebuild        # Rebuild Kimi image"
+            echo "  $0 -p qwen                           # Run with Qwen (short form)"
             echo "  $0 -p minimax -s dev                # Run MiniMax with 'dev' session (short forms)"
             echo "  $0 --provider minimax --session test # Run another MiniMax session"
             echo ""
@@ -92,6 +93,9 @@ while [ $i -le $# ]; do
             echo "  MINIMAX_API_BASE_URL=your_url"
             echo "  KIMI_API_KEY=your_key"
             echo "  KIMI_API_BASE_URL=your_url"
+            echo "  QWEN_API_KEY=your_key"
+            echo "  QWEN_API_BASE_URL=your_url"
+            echo "  QWEN_MODEL=your_model"
             exit 0
             ;;
     esac
@@ -99,8 +103,8 @@ while [ $i -le $# ]; do
 done
 
 # Validate provider
-if [[ ! "$PROVIDER" =~ ^(glm|minimax|kimi)$ ]]; then
-    echo "❌ Error: Invalid provider '$PROVIDER'. Must be one of: glm, minimax, kimi"
+if [[ ! "$PROVIDER" =~ ^(glm|minimax|kimi|qwen)$ ]]; then
+    echo "❌ Error: Invalid provider '$PROVIDER'. Must be one of: glm, minimax, kimi, qwen"
     exit 1
 fi
 
@@ -139,6 +143,12 @@ MINIMAX_MODEL=MiniMax-M2.5
 KIMI_API_KEY=your_kimi_api_key_here
 KIMI_API_BASE_URL=https://api.kimi.com/coding/
 KIMI_API_TIMEOUT_MS=300000
+
+# Qwen Provider
+QWEN_API_KEY=your_qwen_api_key_here
+QWEN_API_BASE_URL=https://coding.dashscope.aliyuncs.com/apps/anthropic
+QWEN_API_TIMEOUT_MS=300000
+QWEN_MODEL=qwen3.5-plus
 
 # Note: All providers share the same Docker image: claude-dev-container
 # Only API keys, endpoints, timeouts, and model configurations differ per provider
@@ -190,6 +200,16 @@ if [ "$PROVIDER" = "minimax" ]; then
     ANTHROPIC_DEFAULT_HAIKU_MODEL="$MINIMAX_MODEL"
 fi
 
+# Load Qwen-specific model variables if provider is qwen
+if [ "$PROVIDER" = "qwen" ]; then
+    QWEN_MODEL="${QWEN_MODEL:-qwen3.5-plus}"
+    ANTHROPIC_MODEL="$QWEN_MODEL"
+    ANTHROPIC_SMALL_FAST_MODEL="$QWEN_MODEL"
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$QWEN_MODEL"
+    ANTHROPIC_DEFAULT_OPUS_MODEL="$QWEN_MODEL"
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_MODEL"
+fi
+
 # Determine Claude settings paths (user-level vs project-level)
 # Default to host user's Claude settings, project settings override when present
 HOST_HOME="${HOME:-/root}"
@@ -235,6 +255,58 @@ if [ "$CLAUDE_JSON" = "$PROJECT_CLAUDE_JSON" ] && [ ! -s "$PROJECT_CLAUDE_JSON" 
     echo "{}" > "$PROJECT_CLAUDE_JSON"
 fi
 
+# Clean up .claude/settings.json: remove env and hooks sections to use Docker env instead
+CLAUDE_SETTINGS_JSON="$CLAUDE_DIR/settings.json"
+if [ -f "$CLAUDE_SETTINGS_JSON" ]; then
+    # Check if jq is available
+    if command -v jq &> /dev/null; then
+        # Use jq to remove env and hooks sections
+        if jq -e '.env or .hooks' "$CLAUDE_SETTINGS_JSON" &> /dev/null; then
+            echo "🧹 Cleaning .claude/settings.json: removing env and hooks sections..."
+            jq 'del(.env, .hooks)' "$CLAUDE_SETTINGS_JSON" > "${CLAUDE_SETTINGS_JSON}.tmp" && \
+            mv "${CLAUDE_SETTINGS_JSON}.tmp" "$CLAUDE_SETTINGS_JSON"
+            echo "✅ Settings cleaned - environment variables will be loaded from Docker"
+        fi
+    elif command -v python3 &> /dev/null; then
+        # Fallback to Python if jq is not available
+        if python3 -c "import json, sys; data=json.load(open('$CLAUDE_SETTINGS_JSON')); sys.exit(0 if ('env' in data or 'hooks' in data) else 1)" 2>/dev/null; then
+            echo "🧹 Cleaning .claude/settings.json: removing env and hooks sections..."
+            TEMP_PY_SCRIPT=$(mktemp)
+            cat > "$TEMP_PY_SCRIPT" << 'PYEOF'
+import json
+import sys
+
+settings_file = sys.argv[1]
+try:
+    with open(settings_file, 'r') as f:
+        data = json.load(f)
+    
+    # Remove env and hooks sections if they exist
+    if 'env' in data:
+        del data['env']
+    if 'hooks' in data:
+        del data['hooks']
+    
+    # Write back
+    with open(settings_file, 'w') as f:
+        json.dump(data, f, indent=2)
+except Exception as e:
+    print(f'Warning: Could not clean settings.json: {e}', file=sys.stderr)
+    sys.exit(1)
+PYEOF
+            python3 "$TEMP_PY_SCRIPT" "$CLAUDE_SETTINGS_JSON"
+            PY_EXIT_CODE=$?
+            rm -f "$TEMP_PY_SCRIPT"
+            if [ $PY_EXIT_CODE -eq 0 ]; then
+                echo "✅ Settings cleaned - environment variables will be loaded from Docker"
+            fi
+        fi
+    else
+        echo "⚠️  Warning: Neither jq nor python3 found. Cannot clean settings.json automatically."
+        echo "   Please manually remove 'env' and 'hooks' sections from $CLAUDE_SETTINGS_JSON"
+    fi
+fi
+
 # Show mode
 if [ "$WORKSPACE_MODE" = true ]; then
     echo "🚀 Starting Claude in WORKSPACE mode: $PROJECT_DIR"
@@ -274,7 +346,7 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         exit 0
     else
         echo "❌ Cancelled. To run multiple sessions:"
-        echo "   - Use a different provider: --provider minimax/kimi/glm"
+        echo "   - Use a different provider: --provider minimax/kimi/glm/qwen"
         echo "   - Use a session identifier: --session <name>"
         echo "   - Or stop the existing container"
         exit 1
@@ -329,6 +401,17 @@ fi
 
 # Add MiniMax-specific model environment variables if provider is minimax
 if [ "$PROVIDER" = "minimax" ]; then
+    DOCKER_ENV_ARGS+=(
+        -e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
+        -e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL"
+        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL"
+        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL"
+        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL"
+    )
+fi
+
+# Add Qwen-specific model environment variables if provider is qwen
+if [ "$PROVIDER" = "qwen" ]; then
     DOCKER_ENV_ARGS+=(
         -e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
         -e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL"
