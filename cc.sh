@@ -85,7 +85,7 @@ while [ $i -le $# ]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --provider, -p PROVIDER  Provider to use: glm, minimax, kimi, or qwen (default: glm)"
+            echo "  --provider, -p PROVIDER  Provider to use: glm, minimax, kimi, qwen, or volcengine (default: glm)"
             echo "                           Can be omitted - defaults to glm"
             echo "  --workspace             Workspace mode (use current directory)"
             echo "  --path PATH             Specific project directory"
@@ -104,6 +104,7 @@ while [ $i -le $# ]; do
             echo "  $0 -p minimax                        # Run with MiniMax (short form)"
             echo "  $0 --provider kimi --rebuild        # Rebuild Kimi image"
             echo "  $0 -p qwen                           # Run with Qwen (short form)"
+            echo "  $0 -p volcengine                     # Run with Volcengine/Ark (short form)"
             echo "  $0 -p minimax -s dev                # Run MiniMax with 'dev' session (short forms)"
             echo "  $0 --provider minimax --session test # Run another MiniMax session"
             echo "  $0 --worktree                        # Git worktree mode (auto-generated name)"
@@ -122,6 +123,9 @@ while [ $i -le $# ]; do
             echo "  QWEN_API_KEY=your_key"
             echo "  QWEN_API_BASE_URL=your_url"
             echo "  QWEN_MODEL=your_model"
+            echo "  VOLCENGINE_API_KEY=your_key"
+            echo "  VOLCENGINE_API_BASE_URL=your_url"
+            echo "  VOLCENGINE_MODEL=your_model"
             exit 0
             ;;
     esac
@@ -129,8 +133,8 @@ while [ $i -le $# ]; do
 done
 
 # Validate provider
-if [[ ! "$PROVIDER" =~ ^(glm|minimax|kimi|qwen)$ ]]; then
-    echo "❌ Error: Invalid provider '$PROVIDER'. Must be one of: glm, minimax, kimi, qwen"
+if [[ ! "$PROVIDER" =~ ^(glm|minimax|kimi|qwen|volcengine)$ ]]; then
+    echo "❌ Error: Invalid provider '$PROVIDER'. Must be one of: glm, minimax, kimi, qwen, volcengine"
     exit 1
 fi
 
@@ -175,6 +179,12 @@ QWEN_API_KEY=your_qwen_api_key_here
 QWEN_API_BASE_URL=https://coding.dashscope.aliyuncs.com/apps/anthropic
 QWEN_API_TIMEOUT_MS=300000
 QWEN_MODEL=qwen3.5-plus
+
+# Volcengine (Ark) Provider
+VOLCENGINE_API_KEY=your_volcengine_api_key_here
+VOLCENGINE_API_BASE_URL=https://ark.cn-beijing.volces.com/api/coding
+VOLCENGINE_API_TIMEOUT_MS=300000
+VOLCENGINE_MODEL=ark-code-latest
 
 # Note: All providers share the same Docker image: claude-dev-container
 # Only API keys, endpoints, timeouts, and model configurations differ per provider
@@ -234,6 +244,16 @@ if [ "$PROVIDER" = "qwen" ]; then
     ANTHROPIC_DEFAULT_SONNET_MODEL="$QWEN_MODEL"
     ANTHROPIC_DEFAULT_OPUS_MODEL="$QWEN_MODEL"
     ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_MODEL"
+fi
+
+# Load Volcengine (Ark)-specific model variables if provider is volcengine
+if [ "$PROVIDER" = "volcengine" ]; then
+    VOLCENGINE_MODEL="${VOLCENGINE_MODEL:-ark-code-latest}"
+    ANTHROPIC_MODEL="$VOLCENGINE_MODEL"
+    ANTHROPIC_SMALL_FAST_MODEL="$VOLCENGINE_MODEL"
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$VOLCENGINE_MODEL"
+    ANTHROPIC_DEFAULT_OPUS_MODEL="$VOLCENGINE_MODEL"
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$VOLCENGINE_MODEL"
 fi
 
 # Determine Claude settings paths (user-level vs project-level)
@@ -404,7 +424,7 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         exit 0
     else
         echo "❌ Cancelled. To run multiple sessions:"
-        echo "   - Use a different provider: --provider minimax/kimi/glm/qwen"
+        echo "   - Use a different provider: --provider minimax/kimi/glm/qwen/volcengine"
         echo "   - Use a session identifier: --session <name>"
         echo "   - Or stop the existing container"
         exit 1
@@ -478,6 +498,17 @@ fi
 
 # Add Qwen-specific model environment variables if provider is qwen
 if [ "$PROVIDER" = "qwen" ]; then
+    DOCKER_ENV_ARGS+=(
+        -e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
+        -e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL"
+        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL"
+        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL"
+        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL"
+    )
+fi
+
+# Add Volcengine (Ark)-specific model environment variables if provider is volcengine
+if [ "$PROVIDER" = "volcengine" ]; then
     DOCKER_ENV_ARGS+=(
         -e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
         -e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL"
