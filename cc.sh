@@ -13,6 +13,9 @@
 #   ./cc.sh --provider kimi --path /path/to/project
 #   ./cc.sh -p minimax -s dev          # Multiple sessions (short forms)
 #   ./cc.sh --provider minimax --session test # Another session (same provider/folder)
+#   ./cc.sh --worktree                  # Git worktree mode (auto-generated name)
+#   ./cc.sh -w feature-auth             # Git worktree with custom name (shorthand)
+#   ./cc.sh --worktree bugfix-123 --tmux # Git worktree with tmux session
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +32,8 @@ WORKSPACE_MODE=false
 REBUILD=false
 PROJECT_DIR="$(pwd)"
 SESSION_ID=""
+USE_TMUX=false
+# WORKTREE_NAME is intentionally unset by default - only set when --worktree is used
 
 # Parse all arguments
 i=1
@@ -63,6 +68,19 @@ while [ $i -le $# ]; do
                 i=$((i+1))  # Skip next argument as it's the session value
             fi
             ;;
+        --worktree|-w)
+            next_idx=$((i+1))
+            if [ $next_idx -le $# ] && [[ ! "${!next_idx}" =~ ^- ]]; then
+                WORKTREE_NAME="${!next_idx}"
+                i=$((i+1))  # Skip next argument as it's the worktree name
+            else
+                # Auto-generate worktree name if not provided
+                WORKTREE_NAME=""
+            fi
+            ;;
+        --tmux)
+            USE_TMUX=true
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -74,6 +92,10 @@ while [ $i -le $# ]; do
             echo "  --rebuild               Force rebuild Docker image (works with or without --provider)"
             echo "  --session, -s ID        Session identifier for multiple sessions of same provider"
             echo "                          Allows running multiple containers with same provider/folder"
+            echo "  --worktree, -w [NAME]   Git worktree mode for isolated parallel development"
+            echo "                          Auto-generates name if not provided"
+            echo "                          Worktrees created at <repo>/.claude/worktrees/<name>/"
+            echo "  --tmux                  Launch in tmux session (use with --worktree)"
             echo "  --help, -h              Show this help message"
             echo ""
             echo "Examples:"
@@ -84,6 +106,10 @@ while [ $i -le $# ]; do
             echo "  $0 -p qwen                           # Run with Qwen (short form)"
             echo "  $0 -p minimax -s dev                # Run MiniMax with 'dev' session (short forms)"
             echo "  $0 --provider minimax --session test # Run another MiniMax session"
+            echo "  $0 --worktree                        # Git worktree mode (auto-generated name)"
+            echo "  $0 -w feature-auth                   # Git worktree with custom name (shorthand)"
+            echo "  $0 --worktree bugfix-123 --tmux      # Git worktree with tmux session"
+            echo "  $0 -p minimax -w refactor-api        # MiniMax provider with worktree"
             echo ""
             echo "The script reads API keys and endpoints from $ENV_FILE"
             echo "Expected format:"
@@ -255,6 +281,28 @@ if [ "$CLAUDE_JSON" = "$PROJECT_CLAUDE_JSON" ] && [ ! -s "$PROJECT_CLAUDE_JSON" 
     echo "{}" > "$PROJECT_CLAUDE_JSON"
 fi
 
+# Ensure plugins directory structure exists for Claude Code plugin installation
+# Claude Code expects: .claude/plugins/marketplaces/claude-plugins-official/external_plugins/
+if [ ! -d "$CLAUDE_DIR" ]; then
+    echo "📁 Creating Claude directory: $CLAUDE_DIR"
+    mkdir -p "$CLAUDE_DIR"
+fi
+
+# Create the full plugins directory structure that Claude Code expects
+PLUGINS_BASE_DIR="$CLAUDE_DIR/plugins"
+PLUGINS_MARKETPLACES_DIR="$PLUGINS_BASE_DIR/marketplaces"
+PLUGINS_OFFICIAL_DIR="$PLUGINS_MARKETPLACES_DIR/claude-plugins-official"
+PLUGINS_EXTERNAL_DIR="$PLUGINS_OFFICIAL_DIR/external_plugins"
+
+if [ ! -d "$PLUGINS_EXTERNAL_DIR" ]; then
+    echo "📦 Creating plugins directory structure for Claude Code..."
+    mkdir -p "$PLUGINS_EXTERNAL_DIR"
+    # Ensure proper permissions (readable/writable by owner, readable by group/others)
+    # This allows the node user in Docker to write to it
+    chmod -R u+rwX "$PLUGINS_BASE_DIR" 2>/dev/null || true
+    echo "✅ Created: $PLUGINS_EXTERNAL_DIR"
+fi
+
 # Clean up .claude/settings.json: remove env and hooks sections to use Docker env instead
 CLAUDE_SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 if [ -f "$CLAUDE_SETTINGS_JSON" ]; then
@@ -304,6 +352,16 @@ PYEOF
     else
         echo "⚠️  Warning: Neither jq nor python3 found. Cannot clean settings.json automatically."
         echo "   Please manually remove 'env' and 'hooks' sections from $CLAUDE_SETTINGS_JSON"
+    fi
+fi
+
+# Validate Git repository when using worktree mode
+if [ -n "${WORKTREE_NAME+x}" ]; then
+    if [ ! -d "$PROJECT_DIR/.git" ]; then
+        echo "❌ Error: Git worktree mode requires a Git repository"
+        echo "   Project directory '$PROJECT_DIR' is not a Git repository"
+        echo "   Please initialize a Git repository first: git init"
+        exit 1
     fi
 fi
 
@@ -358,6 +416,14 @@ echo "🐳 Container: $CONTAINER_NAME"
 echo "🔑 Provider: $PROVIDER"
 if [ -n "$SESSION_ID" ]; then
     echo "🔖 Session: $SESSION_ID"
+fi
+if [ -n "$WORKTREE_NAME" ]; then
+    echo "🌳 Worktree: $WORKTREE_NAME"
+elif [ "$WORKTREE_NAME" = "" ] && [ -n "${WORKTREE_NAME+x}" ]; then
+    echo "🌳 Worktree: auto-generated"
+fi
+if [ "$USE_TMUX" = true ]; then
+    echo "📺 Tmux: enabled"
 fi
 echo ""
 
@@ -436,6 +502,23 @@ if [ -f "$CLAUDE_JSON" ]; then
     DOCKER_VOLUME_ARGS+=(-v "$CLAUDE_JSON:/home/node/.claude.json")
 fi
 
+# Build Claude command arguments
+CLAUDE_ARGS=("--dangerously-skip-permissions")
+
+# Add worktree flag if specified
+if [ -n "${WORKTREE_NAME+x}" ]; then
+    if [ -n "$WORKTREE_NAME" ]; then
+        CLAUDE_ARGS+=("--worktree" "$WORKTREE_NAME")
+    else
+        CLAUDE_ARGS+=("--worktree")
+    fi
+fi
+
+# Add tmux flag if specified
+if [ "$USE_TMUX" = true ]; then
+    CLAUDE_ARGS+=("--tmux")
+fi
+
 # Run Claude Code in Docker
 docker run -it --rm \
     --name "$CONTAINER_NAME" \
@@ -444,4 +527,4 @@ docker run -it --rm \
     -w /workspace \
     --network host \
     "$IMAGE_NAME" \
-    claude --dangerously-skip-permissions
+    claude "${CLAUDE_ARGS[@]}"

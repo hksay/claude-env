@@ -26,6 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   nano \
   vim \
   tmux \
+  python3 \
+  python3-pip \
+  python3-venv \
+  python3-dev \
+  build-essential \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
@@ -61,6 +66,20 @@ USER node
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
+
+# Install Bun (latest version)
+RUN curl -fsSL https://bun.sh/install | bash && \
+    echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.zshrc && \
+    echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.bashrc
+
+# Add Bun to PATH
+ENV PATH=$PATH:/home/node/.bun/bin
+
+# Create python and pip symlinks for convenience
+USER root
+RUN ln -sf /usr/bin/python3 /usr/bin/python && \
+    ln -sf /usr/bin/pip3 /usr/bin/pip
+USER node
 
 # Set the default shell to zsh rather than sh
 ENV SHELL=/bin/zsh
@@ -104,6 +123,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Playwright browsers
 USER node
 RUN npx playwright install chromium
+
+# Verify Node.js, Bun, and Python installations
+RUN node --version && npm --version && bun --version && python3 --version && pip3 --version
 
 
 # Copy and set up firewall script
