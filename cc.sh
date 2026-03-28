@@ -4,27 +4,65 @@
 # Unified script to run Claude Code in Docker with multiple providers
 #
 # Usage:
-#   ./cc.sh                             # Use GLM provider (default)
-#   ./cc.sh -p minimax                  # Use MiniMax provider (short form)
+#   ./cc.sh                             # DEFAULT_PROVIDER from .env or environment (default: glm)
+#   ./cc.sh -b minimax                  # Use MiniMax provider (-b: avoid claude -p/--print)
 #   ./cc.sh --provider kimi             # Use Kimi provider
 #   ./cc.sh --workspace                 # Workspace mode (default provider)
 #   ./cc.sh --rebuild                   # Rebuild Docker image (default provider)
-#   ./cc.sh -p minimax --rebuild        # Rebuild MiniMax Docker image
+#   ./cc.sh -b minimax --rebuild        # Rebuild MiniMax Docker image
 #   ./cc.sh --provider kimi --path /path/to/project
-#   ./cc.sh -p minimax -s dev          # Multiple sessions (short forms)
+#   ./cc.sh -b minimax -s dev          # Multiple sessions (short forms)
 #   ./cc.sh --provider minimax --session test # Another session (same provider/folder)
 #   ./cc.sh --worktree                  # Git worktree mode (auto-generated name)
 #   ./cc.sh -w feature-auth             # Git worktree with custom name (shorthand)
 #   ./cc.sh --worktree bugfix-123 --tmux # Git worktree with tmux session
+#   ./cc.sh --init-env                   # Create .env from .env.example (repo dir only)
+#   ./cc.sh -b minimax -p "fix lint"     # Script flags first; rest forwarded to claude (e.g. -p/--print)
+#   ./cc.sh --native -b minimax          # Run host claude (not Docker); backup/restore ~/.claude/settings.json and ~/.claude.json
 
-# Get the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="$SCRIPT_DIR/.env"
+# Directory containing this script (resolve symlinks so ~/cc.sh -> repo/cc.sh finds repo/docker/)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    _dir="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    _link="$(readlink "$SOURCE")"
+    case "$_link" in
+        /*) SOURCE="$_link" ;;
+        *) SOURCE="$_dir/$_link" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+SCRIPT_ENV_FILE="$SCRIPT_DIR/.env"
+USER_ENV_FILE="$HOME/.env"
+EXAMPLE_ENV_FILE="$SCRIPT_DIR/.env.example"
 
-# Default configuration
-DOCKERFILE_DIR="/Users/kato/dev/claude-env/docker"
-DEFAULT_PROVIDER="glm"
+# Prefer ~/.env, fallback to local script .env when user-level is missing
+if [ -f "$USER_ENV_FILE" ]; then
+    ENV_FILE="$USER_ENV_FILE"
+elif [ -f "$SCRIPT_ENV_FILE" ]; then
+    ENV_FILE="$SCRIPT_ENV_FILE"
+else
+    ENV_FILE="$SCRIPT_ENV_FILE"
+fi
+
+# Default configuration (image build context next to this script)
+DOCKERFILE_DIR="$SCRIPT_DIR/docker"
 DEFAULT_API_TIMEOUT_MS="3000000"
+DEFAULT_PROVIDER="glm"
+
+# Load .env when present (~/.env preferred, else repo .env); if missing, rely on the current environment
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    TEMP_ENV=$(mktemp)
+    grep -v '^[[:space:]]*#' "$ENV_FILE" | grep -v '^[[:space:]]*$' > "$TEMP_ENV"
+    source "$TEMP_ENV"
+    rm -f "$TEMP_ENV"
+    set +a
+fi
+# Optional: set CC_DOCKERFILE_DIR in ~/.env if cc.sh lives outside the repo (copy without docker/)
+if [ -n "${CC_DOCKERFILE_DIR:-}" ]; then
+    DOCKERFILE_DIR="$CC_DOCKERFILE_DIR"
+fi
+DEFAULT_PROVIDER="${DEFAULT_PROVIDER:-glm}"
 
 # Parse arguments
 PROVIDER="$DEFAULT_PROVIDER"
@@ -33,14 +71,23 @@ REBUILD=false
 PROJECT_DIR="$(pwd)"
 SESSION_ID=""
 USE_TMUX=false
+INIT_ENV=false
+NATIVE_MODE=false
 # WORKTREE_NAME is intentionally unset by default - only set when --worktree is used
+CLAUDE_FORWARD_ARGS=()
 
 # Parse all arguments
 i=1
 while [ $i -le $# ]; do
     arg="${!i}"
     case "$arg" in
-        --provider|-p)
+        --native)
+            NATIVE_MODE=true
+            ;;
+        --init-env)
+            INIT_ENV=true
+            ;;
+        --provider|-b)
             if [ $((i+1)) -le $# ]; then
                 next_idx=$((i+1))
                 PROVIDER="${!next_idx}"
@@ -81,12 +128,21 @@ while [ $i -le $# ]; do
         --tmux)
             USE_TMUX=true
             ;;
+        --)
+            i=$((i+1))
+            while [ $i -le $# ]; do
+                CLAUDE_FORWARD_ARGS+=("${!i}")
+                i=$((i+1))
+            done
+            break
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --provider, -p PROVIDER  Provider to use: glm, minimax, kimi, qwen, or volcengine (default: glm)"
-            echo "                           Can be omitted - defaults to glm"
+            echo "  --provider, -b PROVIDER  Provider to use: glm, minimax, kimi, qwen, or volcengine"
+            echo "                           (short -b, not -p: claude uses -p for --print)"
+            echo "                           Default: DEFAULT_PROVIDER from .env/environment, or glm if unset"
             echo "  --workspace             Workspace mode (use current directory)"
             echo "  --path PATH             Specific project directory"
             echo "  --rebuild               Force rebuild Docker image (works with or without --provider)"
@@ -96,41 +152,99 @@ while [ $i -le $# ]; do
             echo "                          Auto-generates name if not provided"
             echo "                          Worktrees created at <repo>/.claude/worktrees/<name>/"
             echo "  --tmux                  Launch in tmux session (use with --worktree)"
+            echo "  --init-env              Copy .env.example to $SCRIPT_ENV_FILE and exit"
+            echo "  --native                Run claude on the host (not Docker). Backs up then overrides"
+            echo "                          ~/.claude/settings.json and ~/.claude.json with this script's"
+            echo "                          provider env; restores them when claude exits."
             echo "  --help, -h              Show this help message"
+            echo "  --                      End of cc.sh options; all following args go to claude only (native: avoids ambiguity)"
+            echo "  ...                     Any other flags/args are forwarded to claude (use after cc.sh options)"
             echo ""
             echo "Examples:"
             echo "  $0                                    # Run with GLM (default)"
             echo "  $0 --rebuild                         # Rebuild GLM image"
-            echo "  $0 -p minimax                        # Run with MiniMax (short form)"
+            echo "  $0 -b minimax                        # Run with MiniMax (short form)"
             echo "  $0 --provider kimi --rebuild        # Rebuild Kimi image"
-            echo "  $0 -p qwen                           # Run with Qwen (short form)"
-            echo "  $0 -p volcengine                     # Run with Volcengine/Ark (short form)"
-            echo "  $0 -p minimax -s dev                # Run MiniMax with 'dev' session (short forms)"
+            echo "  $0 -b qwen                           # Run with Qwen (short form)"
+            echo "  $0 -b volcengine                     # Run with Volcengine/Ark (short form)"
+            echo "  $0 -b minimax -s dev                # Run MiniMax with 'dev' session (short forms)"
             echo "  $0 --provider minimax --session test # Run another MiniMax session"
             echo "  $0 --worktree                        # Git worktree mode (auto-generated name)"
             echo "  $0 -w feature-auth                   # Git worktree with custom name (shorthand)"
             echo "  $0 --worktree bugfix-123 --tmux      # Git worktree with tmux session"
-            echo "  $0 -p minimax -w refactor-api        # MiniMax provider with worktree"
+            echo "  $0 -b minimax -w refactor-api        # MiniMax provider with worktree"
+            echo "  $0 --init-env                        # Bootstrap .env from .env.example"
+            echo "  $0 --native -b minimax               # Host claude + MiniMax env in ~/.claude (restored after exit)"
             echo ""
-            echo "The script reads API keys and endpoints from $ENV_FILE"
-            echo "Expected format:"
-            echo "  GLM_API_KEY=your_key"
-            echo "  GLM_API_BASE_URL=your_url"
-            echo "  MINIMAX_API_KEY=your_key"
-            echo "  MINIMAX_API_BASE_URL=your_url"
-            echo "  KIMI_API_KEY=your_key"
-            echo "  KIMI_API_BASE_URL=your_url"
-            echo "  QWEN_API_KEY=your_key"
-            echo "  QWEN_API_BASE_URL=your_url"
-            echo "  QWEN_MODEL=your_model"
-            echo "  VOLCENGINE_API_KEY=your_key"
-            echo "  VOLCENGINE_API_BASE_URL=your_url"
-            echo "  VOLCENGINE_MODEL=your_model"
+            echo "Config: loads ~/.env if present, else $SCRIPT_ENV_FILE if present; otherwise use exported variables."
+            echo "Global defaults (override per provider with PREFIX_* when needed):"
+            echo "  DEFAULT_PROVIDER  API_TIMEOUT_MS  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+            echo "Each provider (PREFIX = GLM, MINIMAX, KIMI, QWEN, VOLCENGINE):"
+            echo "  \${PREFIX}_API_KEY  \${PREFIX}_API_BASE_URL"
+            echo "  optional: \${PREFIX}_API_TIMEOUT_MS  \${PREFIX}_CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC  \${PREFIX}_MODEL"
+            echo "  \${PREFIX}_MODEL — if unset or empty, Anthropic model env vars are not passed to the container"
+            echo ""
+            echo "Any other arguments are passed through to claude inside the container (after script options)."
+            echo "Put cc.sh flags first; e.g. $0 -b minimax -p \"prompt\" runs claude with --print."
             exit 0
+            ;;
+        *)
+            CLAUDE_FORWARD_ARGS+=("$arg")
             ;;
     esac
     i=$((i+1))
 done
+
+if [ "$INIT_ENV" = true ]; then
+    if [ ! -f "$EXAMPLE_ENV_FILE" ]; then
+        echo "❌ Error: $EXAMPLE_ENV_FILE not found (cannot bootstrap .env)"
+        exit 1
+    fi
+    if [ -f "$SCRIPT_ENV_FILE" ]; then
+        echo "⚠️  $SCRIPT_ENV_FILE already exists. Remove or rename it, then run again."
+        exit 1
+    fi
+    cp "$EXAMPLE_ENV_FILE" "$SCRIPT_ENV_FILE"
+    echo "✅ Created $SCRIPT_ENV_FILE from .env.example"
+    echo "   Fill in API keys for the provider(s) you use, then run: $0 -b <provider>"
+    echo "   cc.sh prefers ~/.env when present; copy there if you want a user-wide config."
+    exit 0
+fi
+
+# --- --native: backup/restore global Claude config (~/.claude/settings.json, ~/.claude.json) ---
+NATIVE_RESTORE_RAN=0
+
+native_restore() {
+    [ "$NATIVE_RESTORE_RAN" = 1 ] && return
+    NATIVE_RESTORE_RAN=1
+    trap - EXIT INT TERM HUP
+    local gs="$HOME/.claude/settings.json"
+    local gj="$HOME/.claude.json"
+    if [ -n "${NATIVE_SETTINGS_BACKUP:-}" ]; then
+        mv -f "$NATIVE_SETTINGS_BACKUP" "$gs" 2>/dev/null || true
+    elif [ "${NATIVE_SETTINGS_CREATED:-0}" = 1 ]; then
+        rm -f "$gs" 2>/dev/null || true
+    fi
+    if [ -n "${NATIVE_CLAUDE_JSON_BACKUP:-}" ]; then
+        mv -f "$NATIVE_CLAUDE_JSON_BACKUP" "$gj" 2>/dev/null || true
+    elif [ "${NATIVE_CLAUDE_JSON_CREATED:-0}" = 1 ]; then
+        rm -f "$gj" 2>/dev/null || true
+    fi
+}
+
+native_backup_global_file() {
+    local f="$1"
+    local b="${f}.cc-sh-backup.$(date +%Y%m%d%H%M%S).$$"
+    cp -p "$f" "$b" || return 1
+    printf '%s\n' "$b"
+}
+
+# Absolute path: Docker resolves relative bind mounts from the client cwd; post-build `cd` must not break --path
+if ! PROJECT_DIR_RESOLVED=$(cd "$PROJECT_DIR" && pwd); then
+    echo "❌ Error: Cannot access project directory: $PROJECT_DIR"
+    exit 1
+fi
+PROJECT_DIR="$PROJECT_DIR_RESOLVED"
 
 # Validate provider
 if [[ ! "$PROVIDER" =~ ^(glm|minimax|kimi|qwen|volcengine)$ ]]; then
@@ -138,194 +252,105 @@ if [[ ! "$PROVIDER" =~ ^(glm|minimax|kimi|qwen|volcengine)$ ]]; then
     exit 1
 fi
 
-# Load environment variables from .env file
-if [ -f "$ENV_FILE" ]; then
-    # Export variables from .env file, handling comments and empty lines
-    set -a
-    # Create a temporary file with filtered content (no comments, no empty lines)
-    TEMP_ENV=$(mktemp)
-    grep -v '^[[:space:]]*#' "$ENV_FILE" | grep -v '^[[:space:]]*$' > "$TEMP_ENV"
-    # Source the temporary file
-    source "$TEMP_ENV"
-    # Clean up
-    rm -f "$TEMP_ENV"
-    set +a
-else
-    echo "⚠️  Warning: .env file not found at $ENV_FILE"
-    echo "   Creating a template .env file..."
-    cat > "$ENV_FILE" << 'EOF'
-# Claude Code Provider Configuration
-# Extracted from cc.sh, cc-minimax.sh, and cc-kimi.sh
-# Update these values with your actual API keys and endpoints
+# Provider settings: from .env if sourced above, else from the parent process environment
 
-# GLM Provider
-GLM_API_KEY=your_glm_api_key_here
-GLM_API_BASE_URL=https://open.bigmodel.cn/api/anthropic
-GLM_API_TIMEOUT_MS=3000000
-
-# MiniMax Provider
-MINIMAX_API_KEY=your_minimax_api_key_here
-MINIMAX_API_BASE_URL=https://api.minimaxi.com/anthropic
-MINIMAX_API_TIMEOUT_MS=3000000
-MINIMAX_MODEL=MiniMax-M2.5
-
-# Kimi Provider
-KIMI_API_KEY=your_kimi_api_key_here
-KIMI_API_BASE_URL=https://api.kimi.com/coding/
-KIMI_API_TIMEOUT_MS=300000
-
-# Qwen Provider
-QWEN_API_KEY=your_qwen_api_key_here
-QWEN_API_BASE_URL=https://coding.dashscope.aliyuncs.com/apps/anthropic
-QWEN_API_TIMEOUT_MS=300000
-QWEN_MODEL=qwen3.5-plus
-
-# Volcengine (Ark) Provider
-VOLCENGINE_API_KEY=your_volcengine_api_key_here
-VOLCENGINE_API_BASE_URL=https://ark.cn-beijing.volces.com/api/coding
-VOLCENGINE_API_TIMEOUT_MS=300000
-VOLCENGINE_MODEL=ark-code-latest
-
-# Note: All providers share the same Docker image: claude-dev-container
-# Only API keys, endpoints, timeouts, and model configurations differ per provider
-EOF
-    echo "✅ Created template .env file at $ENV_FILE"
-    echo "   Please update it with your API keys and endpoints, then run the script again."
-    exit 1
-fi
-
-# Load provider-specific configuration
+# Load provider-specific configuration (${PROVIDER_UPPER}_* from .env or environment)
 PROVIDER_UPPER=$(echo "$PROVIDER" | tr '[:lower:]' '[:upper:]')
 API_KEY_VAR="${PROVIDER_UPPER}_API_KEY"
 API_BASE_URL_VAR="${PROVIDER_UPPER}_API_BASE_URL"
 API_TIMEOUT_VAR="${PROVIDER_UPPER}_API_TIMEOUT_MS"
+DISABLE_NONESSENTIAL_VAR="${PROVIDER_UPPER}_CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+MODEL_VAR="${PROVIDER_UPPER}_MODEL"
 
-# Get values from environment (with defaults)
 # All providers share the same Docker image (only runtime env vars differ)
-# Force same image name for all providers to ensure consistency
 IMAGE_NAME="claude-dev-container"
 API_KEY="${!API_KEY_VAR}"
 API_BASE_URL="${!API_BASE_URL_VAR}"
-API_TIMEOUT_MS="${!API_TIMEOUT_VAR:-$DEFAULT_API_TIMEOUT_MS}"
+PROVIDER_MODEL="${!MODEL_VAR}"
+if [ -n "$PROVIDER_MODEL" ]; then
+    MODEL_DISPLAY="$PROVIDER_MODEL"
+else
+    MODEL_DISPLAY="(unset — $MODEL_VAR empty)"
+fi
+
+# API_TIMEOUT_MS: global default, unless PREFIX_API_TIMEOUT_MS is set
+PROVIDER_API_TIMEOUT_MS="${!API_TIMEOUT_VAR}"
+if [ -n "$PROVIDER_API_TIMEOUT_MS" ]; then
+    API_TIMEOUT_MS="$PROVIDER_API_TIMEOUT_MS"
+else
+    API_TIMEOUT_MS="${API_TIMEOUT_MS:-$DEFAULT_API_TIMEOUT_MS}"
+fi
+
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: global default, unless PREFIX_CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set
+PROVIDER_DISABLE_NONESSENTIAL="${!DISABLE_NONESSENTIAL_VAR}"
+if [ -n "$PROVIDER_DISABLE_NONESSENTIAL" ]; then
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="$PROVIDER_DISABLE_NONESSENTIAL"
+else
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}"
+fi
 
 # Validate required variables
 if [ -z "$API_KEY" ]; then
-    echo "❌ Error: ${API_KEY_VAR} not found in .env file"
+    echo "❌ Error: ${API_KEY_VAR} is not set (add to .env or export it before running)"
     exit 1
 fi
 
 if [ -z "$API_BASE_URL" ]; then
-    echo "❌ Error: ${API_BASE_URL_VAR} not found in .env file"
+    echo "❌ Error: ${API_BASE_URL_VAR} is not set (add to .env or export it before running)"
     exit 1
 fi
 
-# Load GLM-specific model variables if provider is glm
-if [ "$PROVIDER" = "glm" ]; then
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-5}"
-    ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5}"
-    ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5}"
+if [ "$NATIVE_MODE" = true ]; then
+    if [ "$REBUILD" = true ]; then
+        echo "ℹ️  --rebuild is ignored in --native mode."
+    fi
+    if ! command -v jq &> /dev/null; then
+        echo "❌ Error: --native requires jq to write ~/.claude/settings.json."
+        exit 1
+    fi
+    if ! command -v claude &> /dev/null; then
+        echo "❌ Error: claude not found in PATH (install Claude Code CLI for --native)."
+        exit 1
+    fi
 fi
 
-# Load MiniMax-specific model variables if provider is minimax
-if [ "$PROVIDER" = "minimax" ]; then
-    MINIMAX_MODEL="${MINIMAX_MODEL:-MiniMax-M2.5}"
-    ANTHROPIC_MODEL="$MINIMAX_MODEL"
-    ANTHROPIC_SMALL_FAST_MODEL="$MINIMAX_MODEL"
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$MINIMAX_MODEL"
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$MINIMAX_MODEL"
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="$MINIMAX_MODEL"
-fi
+# Project-local Claude only: never read, mount, or copy from ~/.claude
+CLAUDE_DIR="$PROJECT_DIR/.claude"
+CLAUDE_JSON="$PROJECT_DIR/.claude.json"
 
-# Load Qwen-specific model variables if provider is qwen
-if [ "$PROVIDER" = "qwen" ]; then
-    QWEN_MODEL="${QWEN_MODEL:-qwen3.5-plus}"
-    ANTHROPIC_MODEL="$QWEN_MODEL"
-    ANTHROPIC_SMALL_FAST_MODEL="$QWEN_MODEL"
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$QWEN_MODEL"
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$QWEN_MODEL"
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_MODEL"
-fi
+if [ "$NATIVE_MODE" != true ]; then
+    echo "📁 Project-local Claude: $CLAUDE_DIR and $CLAUDE_JSON (host ~/.claude is unused)"
 
-# Load Volcengine (Ark)-specific model variables if provider is volcengine
-if [ "$PROVIDER" = "volcengine" ]; then
-    VOLCENGINE_MODEL="${VOLCENGINE_MODEL:-ark-code-latest}"
-    ANTHROPIC_MODEL="$VOLCENGINE_MODEL"
-    ANTHROPIC_SMALL_FAST_MODEL="$VOLCENGINE_MODEL"
-    ANTHROPIC_DEFAULT_SONNET_MODEL="$VOLCENGINE_MODEL"
-    ANTHROPIC_DEFAULT_OPUS_MODEL="$VOLCENGINE_MODEL"
-    ANTHROPIC_DEFAULT_HAIKU_MODEL="$VOLCENGINE_MODEL"
-fi
+    # Minimal .claude.json stub if missing or empty — no import from global settings
+    if [ ! -s "$CLAUDE_JSON" ]; then
+        echo "{}" > "$CLAUDE_JSON"
+    fi
 
-# Determine Claude settings paths (user-level vs project-level)
-# Default to host user's Claude settings, project settings override when present
-HOST_HOME="${HOME:-/root}"
-HOST_CLAUDE_DIR="$HOST_HOME/.claude"
-HOST_CLAUDE_JSON="$HOST_HOME/.claude.json"
+    # Ensure plugins directory structure exists for Claude Code plugin installation
+    # Claude Code expects: .claude/plugins/marketplaces/claude-plugins-official/external_plugins/
+    if [ ! -d "$CLAUDE_DIR" ]; then
+        echo "📁 Creating Claude directory: $CLAUDE_DIR"
+        mkdir -p "$CLAUDE_DIR"
+    fi
 
-# Check if project has its own Claude settings (these will override user settings)
-PROJECT_CLAUDE_DIR="$PROJECT_DIR/.claude"
-PROJECT_CLAUDE_JSON="$PROJECT_DIR/.claude.json"
+    # Create the full plugins directory structure that Claude Code expects
+    PLUGINS_BASE_DIR="$CLAUDE_DIR/plugins"
+    PLUGINS_MARKETPLACES_DIR="$PLUGINS_BASE_DIR/marketplaces"
+    PLUGINS_OFFICIAL_DIR="$PLUGINS_MARKETPLACES_DIR/claude-plugins-official"
+    PLUGINS_EXTERNAL_DIR="$PLUGINS_OFFICIAL_DIR/external_plugins"
 
-# Determine which settings to use (project overrides user, but can mix)
-# For .claude directory: use project if exists, otherwise user
-if [ -d "$PROJECT_CLAUDE_DIR" ]; then
-    CLAUDE_DIR="$PROJECT_CLAUDE_DIR"
-    CLAUDE_DIR_SOURCE="project"
-else
-    CLAUDE_DIR="$HOST_CLAUDE_DIR"
-    CLAUDE_DIR_SOURCE="user"
-fi
+    if [ ! -d "$PLUGINS_EXTERNAL_DIR" ]; then
+        echo "📦 Creating plugins directory structure for Claude Code..."
+        mkdir -p "$PLUGINS_EXTERNAL_DIR"
+        # Ensure proper permissions (readable/writable by owner, readable by group/others)
+        # This allows the node user in Docker to write to it
+        chmod -R u+rwX "$PLUGINS_BASE_DIR" 2>/dev/null || true
+        echo "✅ Created: $PLUGINS_EXTERNAL_DIR"
+    fi
 
-# For .claude.json: use project if exists, otherwise user
-if [ -f "$PROJECT_CLAUDE_JSON" ]; then
-    CLAUDE_JSON="$PROJECT_CLAUDE_JSON"
-    CLAUDE_JSON_SOURCE="project"
-else
-    CLAUDE_JSON="$HOST_CLAUDE_JSON"
-    CLAUDE_JSON_SOURCE="user"
-fi
-
-# Show which settings are being used
-if [ "$CLAUDE_DIR_SOURCE" = "project" ] || [ "$CLAUDE_JSON_SOURCE" = "project" ]; then
-    echo "📁 Using project-level Claude settings"
-    [ "$CLAUDE_DIR_SOURCE" = "project" ] && echo "   .claude directory: project"
-    [ "$CLAUDE_JSON_SOURCE" = "project" ] && echo "   .claude.json: project"
-    [ "$CLAUDE_DIR_SOURCE" = "user" ] && echo "   .claude directory: user ($HOST_HOME)"
-    [ "$CLAUDE_JSON_SOURCE" = "user" ] && echo "   .claude.json: user ($HOST_HOME)"
-else
-    echo "👤 Using user-level Claude settings from $HOST_HOME"
-fi
-
-# Ensure .claude.json exists as a file with valid JSON (only for project, not user)
-if [ "$CLAUDE_JSON" = "$PROJECT_CLAUDE_JSON" ] && [ ! -s "$PROJECT_CLAUDE_JSON" ]; then
-    echo "{}" > "$PROJECT_CLAUDE_JSON"
-fi
-
-# Ensure plugins directory structure exists for Claude Code plugin installation
-# Claude Code expects: .claude/plugins/marketplaces/claude-plugins-official/external_plugins/
-if [ ! -d "$CLAUDE_DIR" ]; then
-    echo "📁 Creating Claude directory: $CLAUDE_DIR"
-    mkdir -p "$CLAUDE_DIR"
-fi
-
-# Create the full plugins directory structure that Claude Code expects
-PLUGINS_BASE_DIR="$CLAUDE_DIR/plugins"
-PLUGINS_MARKETPLACES_DIR="$PLUGINS_BASE_DIR/marketplaces"
-PLUGINS_OFFICIAL_DIR="$PLUGINS_MARKETPLACES_DIR/claude-plugins-official"
-PLUGINS_EXTERNAL_DIR="$PLUGINS_OFFICIAL_DIR/external_plugins"
-
-if [ ! -d "$PLUGINS_EXTERNAL_DIR" ]; then
-    echo "📦 Creating plugins directory structure for Claude Code..."
-    mkdir -p "$PLUGINS_EXTERNAL_DIR"
-    # Ensure proper permissions (readable/writable by owner, readable by group/others)
-    # This allows the node user in Docker to write to it
-    chmod -R u+rwX "$PLUGINS_BASE_DIR" 2>/dev/null || true
-    echo "✅ Created: $PLUGINS_EXTERNAL_DIR"
-fi
-
-# Clean up .claude/settings.json: remove env and hooks sections to use Docker env instead
-CLAUDE_SETTINGS_JSON="$CLAUDE_DIR/settings.json"
-if [ -f "$CLAUDE_SETTINGS_JSON" ]; then
+    # Remove env/hooks from project settings.json so Docker-supplied env wins
+    CLAUDE_SETTINGS_JSON="$CLAUDE_DIR/settings.json"
+    if [ -f "$CLAUDE_SETTINGS_JSON" ]; then
     # Check if jq is available
     if command -v jq &> /dev/null; then
         # Use jq to remove env and hooks sections
@@ -373,11 +398,12 @@ PYEOF
         echo "⚠️  Warning: Neither jq nor python3 found. Cannot clean settings.json automatically."
         echo "   Please manually remove 'env' and 'hooks' sections from $CLAUDE_SETTINGS_JSON"
     fi
+    fi
 fi
 
-# Validate Git repository when using worktree mode
+# Validate Git repository when using worktree mode (linked worktrees use a .git file, not a directory)
 if [ -n "${WORKTREE_NAME+x}" ]; then
-    if [ ! -d "$PROJECT_DIR/.git" ]; then
+    if [ ! -e "$PROJECT_DIR/.git" ]; then
         echo "❌ Error: Git worktree mode requires a Git repository"
         echo "   Project directory '$PROJECT_DIR' is not a Git repository"
         echo "   Please initialize a Git repository first: git init"
@@ -385,16 +411,121 @@ if [ -n "${WORKTREE_NAME+x}" ]; then
     fi
 fi
 
+# Build Claude CLI arguments (worktree/tmux). Docker always prepends --dangerously-skip-permissions.
+# Native runs: forwarded args first, then these, so user claude flags are not overridden by script flags.
+CLAUDE_ARGS=()
+if [ -n "${WORKTREE_NAME+x}" ]; then
+    if [ -n "$WORKTREE_NAME" ]; then
+        CLAUDE_ARGS+=("--worktree" "$WORKTREE_NAME")
+    else
+        CLAUDE_ARGS+=("--worktree")
+    fi
+fi
+if [ "$USE_TMUX" = true ]; then
+    CLAUDE_ARGS+=("--tmux")
+fi
+
 # Show mode
-if [ "$WORKSPACE_MODE" = true ]; then
+if [ "$NATIVE_MODE" = true ]; then
+    echo "🖥 Native mode: $PROJECT_DIR"
+    echo "   Provider: $PROVIDER  |  Model: $MODEL_DISPLAY"
+    echo "   ~/.claude/settings.json + ~/.claude.json: backup → override → restore on exit"
+    if [ -n "$SESSION_ID" ]; then
+        echo "🔖 Session: $SESSION_ID (informational; no separate container in native mode)"
+    fi
+    if [ -n "$WORKTREE_NAME" ]; then
+        echo "🌳 Worktree: $WORKTREE_NAME"
+    elif [ "$WORKTREE_NAME" = "" ] && [ -n "${WORKTREE_NAME+x}" ]; then
+        echo "🌳 Worktree: auto-generated"
+    fi
+    if [ "$USE_TMUX" = true ]; then
+        echo "📺 Tmux: enabled"
+    fi
+    echo ""
+elif [ "$WORKSPACE_MODE" = true ]; then
     echo "🚀 Starting Claude in WORKSPACE mode: $PROJECT_DIR"
     echo "   Provider: $PROVIDER"
+    echo "   Model: $MODEL_DISPLAY"
     echo "   You can work with multiple projects from here"
     echo ""
 else
     echo "🚀 Starting Claude in PROJECT mode: $PROJECT_DIR"
     echo "   Provider: $PROVIDER"
+    echo "   Model: $MODEL_DISPLAY"
     echo ""
+fi
+
+if [ "$NATIVE_MODE" = true ]; then
+    NATIVE_SETTINGS_BACKUP=""
+    NATIVE_SETTINGS_CREATED=0
+    NATIVE_CLAUDE_JSON_BACKUP=""
+    NATIVE_CLAUDE_JSON_CREATED=0
+    GLOBAL_SETTINGS="$HOME/.claude/settings.json"
+    GLOBAL_CLAUDE_JSON="$HOME/.claude.json"
+    if [ -f "$GLOBAL_SETTINGS" ]; then
+        NATIVE_SETTINGS_BACKUP=$(native_backup_global_file "$GLOBAL_SETTINGS") || exit 1
+        echo "📋 Backed up $GLOBAL_SETTINGS → $NATIVE_SETTINGS_BACKUP"
+    else
+        NATIVE_SETTINGS_CREATED=1
+    fi
+    mkdir -p "$HOME/.claude" || exit 1
+    SETTINGS_TMP=$(mktemp) || exit 1
+    if [ -n "$PROVIDER_MODEL" ]; then
+        jq -n \
+            --arg token "$API_KEY" \
+            --arg base "$API_BASE_URL" \
+            --arg timeout "$API_TIMEOUT_MS" \
+            --arg cdt "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" \
+            --arg model "$PROVIDER_MODEL" \
+            '{
+                env: {
+                    ANTHROPIC_BASE_URL: $base,
+                    ANTHROPIC_AUTH_TOKEN: $token,
+                    API_TIMEOUT_MS: $timeout,
+                    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: (if $cdt == "" then 1 else ($cdt | tonumber) end),
+                    ANTHROPIC_MODEL: $model,
+                    ANTHROPIC_SMALL_FAST_MODEL: $model,
+                    ANTHROPIC_DEFAULT_SONNET_MODEL: $model,
+                    ANTHROPIC_DEFAULT_OPUS_MODEL: $model,
+                    ANTHROPIC_DEFAULT_HAIKU_MODEL: $model
+                }
+            }' > "$SETTINGS_TMP" || { rm -f "$SETTINGS_TMP"; exit 1; }
+    else
+        jq -n \
+            --arg token "$API_KEY" \
+            --arg base "$API_BASE_URL" \
+            --arg timeout "$API_TIMEOUT_MS" \
+            --arg cdt "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" \
+            '{
+                env: {
+                    ANTHROPIC_BASE_URL: $base,
+                    ANTHROPIC_AUTH_TOKEN: $token,
+                    API_TIMEOUT_MS: $timeout,
+                    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: (if $cdt == "" then 1 else ($cdt | tonumber) end)
+                }
+            }' > "$SETTINGS_TMP" || { rm -f "$SETTINGS_TMP"; exit 1; }
+    fi
+    mv "$SETTINGS_TMP" "$GLOBAL_SETTINGS" || exit 1
+    echo "✅ Wrote provider env to $GLOBAL_SETTINGS"
+
+    if [ -f "$GLOBAL_CLAUDE_JSON" ]; then
+        NATIVE_CLAUDE_JSON_BACKUP=$(native_backup_global_file "$GLOBAL_CLAUDE_JSON") || exit 1
+        echo "📋 Backed up $GLOBAL_CLAUDE_JSON → $NATIVE_CLAUDE_JSON_BACKUP"
+        JSON_TMP=$(mktemp) || exit 1
+        jq '. + {"hasCompletedOnboarding": true}' "$NATIVE_CLAUDE_JSON_BACKUP" > "$JSON_TMP" && \
+            mv "$JSON_TMP" "$GLOBAL_CLAUDE_JSON" || { rm -f "$JSON_TMP"; exit 1; }
+    else
+        NATIVE_CLAUDE_JSON_CREATED=1
+        echo '{"hasCompletedOnboarding": true}' > "$GLOBAL_CLAUDE_JSON" || exit 1
+    fi
+    echo "✅ Ensured hasCompletedOnboarding in $GLOBAL_CLAUDE_JSON"
+    echo ""
+
+    NATIVE_RESTORE_RAN=0
+    trap native_restore EXIT INT TERM HUP
+    cd "$PROJECT_DIR" || { native_restore; trap - EXIT INT TERM HUP; exit 1; }
+    claude "${CLAUDE_FORWARD_ARGS[@]}" "${CLAUDE_ARGS[@]}"
+    exit $?
 fi
 
 # Generate container name with provider prefix to ensure uniqueness
@@ -434,6 +565,7 @@ fi
 echo "📦 Image: $IMAGE_NAME (shared across all providers)"
 echo "🐳 Container: $CONTAINER_NAME"
 echo "🔑 Provider: $PROVIDER"
+echo "🤖 Model: $MODEL_DISPLAY"
 if [ -n "$SESSION_ID" ]; then
     echo "🔖 Session: $SESSION_ID"
 fi
@@ -455,10 +587,10 @@ if [ "$REBUILD" = true ] || ! docker image inspect "$IMAGE_NAME" &> /dev/null; t
         echo "📦 Docker image '$IMAGE_NAME' not found. Building..."
     fi
     if [ -f "$DOCKERFILE_DIR/Dockerfile" ]; then
-        cd "$DOCKERFILE_DIR"
-        docker build -t "$IMAGE_NAME" .
+        cd "$DOCKERFILE_DIR" || exit 1
+        docker build -t "$IMAGE_NAME" . || exit 1
         echo "✅ Build complete!"
-        cd "$PROJECT_DIR"
+        cd "$PROJECT_DIR" || exit 1
     else
         echo "❌ Error: Dockerfile not found at $DOCKERFILE_DIR/Dockerfile"
         exit 1
@@ -470,85 +602,28 @@ DOCKER_ENV_ARGS=(
     -e "ANTHROPIC_AUTH_TOKEN=$API_KEY"
     -e "ANTHROPIC_BASE_URL=$API_BASE_URL"
     -e "API_TIMEOUT_MS=$API_TIMEOUT_MS"
-    -e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+    -e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
     -e "CLAUDE_CODE_CONTAINER_MODE=1"
     -e "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
     -e "BYPASS_ALL_CONFIRMATIONS=1"
 )
 
-# Add GLM-specific model environment variables if provider is glm
-if [ "$PROVIDER" = "glm" ]; then
+if [ -n "$PROVIDER_MODEL" ]; then
     DOCKER_ENV_ARGS+=(
-        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL"
-        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL"
-        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL"
+        -e "ANTHROPIC_MODEL=$PROVIDER_MODEL"
+        -e "ANTHROPIC_SMALL_FAST_MODEL=$PROVIDER_MODEL"
+        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$PROVIDER_MODEL"
+        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$PROVIDER_MODEL"
+        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$PROVIDER_MODEL"
     )
 fi
 
-# Add MiniMax-specific model environment variables if provider is minimax
-if [ "$PROVIDER" = "minimax" ]; then
-    DOCKER_ENV_ARGS+=(
-        -e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
-        -e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL"
-        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL"
-        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL"
-        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL"
-    )
-fi
-
-# Add Qwen-specific model environment variables if provider is qwen
-if [ "$PROVIDER" = "qwen" ]; then
-    DOCKER_ENV_ARGS+=(
-        -e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
-        -e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL"
-        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL"
-        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL"
-        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL"
-    )
-fi
-
-# Add Volcengine (Ark)-specific model environment variables if provider is volcengine
-if [ "$PROVIDER" = "volcengine" ]; then
-    DOCKER_ENV_ARGS+=(
-        -e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
-        -e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL"
-        -e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL"
-        -e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL"
-        -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL"
-    )
-fi
-
-# Prepare volume mounts for Claude settings
-# Mount the determined Claude directory and JSON file
+# Bind project workspace and project-only Claude paths (same host dirs as /workspace/.claude*)
 DOCKER_VOLUME_ARGS=(
     -v "$PROJECT_DIR:/workspace"
+    -v "$CLAUDE_DIR:/home/node/.claude"
+    -v "$CLAUDE_JSON:/home/node/.claude.json"
 )
-
-# Mount Claude settings (project-level if exists, otherwise user-level)
-if [ -d "$CLAUDE_DIR" ]; then
-    DOCKER_VOLUME_ARGS+=(-v "$CLAUDE_DIR:/home/node/.claude")
-fi
-
-if [ -f "$CLAUDE_JSON" ]; then
-    DOCKER_VOLUME_ARGS+=(-v "$CLAUDE_JSON:/home/node/.claude.json")
-fi
-
-# Build Claude command arguments
-CLAUDE_ARGS=("--dangerously-skip-permissions")
-
-# Add worktree flag if specified
-if [ -n "${WORKTREE_NAME+x}" ]; then
-    if [ -n "$WORKTREE_NAME" ]; then
-        CLAUDE_ARGS+=("--worktree" "$WORKTREE_NAME")
-    else
-        CLAUDE_ARGS+=("--worktree")
-    fi
-fi
-
-# Add tmux flag if specified
-if [ "$USE_TMUX" = true ]; then
-    CLAUDE_ARGS+=("--tmux")
-fi
 
 # Run Claude Code in Docker
 docker run -it --rm \
@@ -558,4 +633,4 @@ docker run -it --rm \
     -w /workspace \
     --network host \
     "$IMAGE_NAME" \
-    claude "${CLAUDE_ARGS[@]}"
+    claude --dangerously-skip-permissions "${CLAUDE_ARGS[@]}" "${CLAUDE_FORWARD_ARGS[@]}"
